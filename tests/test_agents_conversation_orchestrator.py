@@ -126,6 +126,20 @@ class ConversationOrchestratorAgentTests(unittest.TestCase):
         self.assertEqual(out["tool_calls"][0]["arguments"]["service_date"], "2026-04-11")
         self.assertEqual(out["turn"]["target_date"], "2026-04-11")
 
+    def test_weather_and_conversation_context_tools_are_parsed(self) -> None:
+        provider = FakeProvider(response={
+            "text": "I will check the weather detail and recent context.",
+            "tool_calls": [
+                {"name": "query_service_weather", "arguments": {"service_date": "2026-04-14"}},
+                {"name": "query_recent_conversation_context", "arguments": {"limit": 12, "topic": "weather"}},
+            ],
+            "suggested_messages": [],
+        })
+        agent = ConversationOrchestratorAgent(self.policy, provider)
+        result = agent.run(_ctx(_base_payload()))
+        calls = result.outputs[0]["tool_calls"]
+        self.assertEqual([call["name"] for call in calls], ["query_service_weather", "query_recent_conversation_context"])
+
     def test_tool_name_alias_is_parsed(self) -> None:
         provider = FakeProvider(response={
             "text": "I saved that.",
@@ -363,7 +377,7 @@ class ConversationOrchestratorAgentTests(unittest.TestCase):
         result = agent.run(_ctx(_base_payload()))
         self.assertEqual(result.status, AgentStatus.OK)
         self.assertNotIn("112", result.outputs[0]["text"])
-        self.assertIn("AI response was unavailable", result.outputs[0]["text"])
+        self.assertIn("could not produce a reply", result.outputs[0]["text"])
 
     def test_tool_result_number_is_groundable(self) -> None:
         payload = _base_payload()

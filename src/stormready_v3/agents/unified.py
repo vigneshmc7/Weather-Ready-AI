@@ -29,7 +29,10 @@ from stormready_v3.storage.repositories import OperatorContextDigestRepository, 
 from stormready_v3.workflows.setup_context_digests import ensure_setup_context_digests
 
 
-_CHAT_AI_UNAVAILABLE_TEXT = "I cannot answer in chat right now because the AI response was unavailable."
+_CHAT_MODEL_UNAVAILABLE_TEXT = "Chat could not produce a reply this time. Please try again in a moment."
+_CHAT_CONTEXT_UNAVAILABLE_TEXT = "I do not have the latest forecast snapshot yet. Refresh once, then I can answer from the current numbers."
+_RECENT_TURN_LIMIT = 20
+_RECENT_TURN_CHAR_LIMIT = 700
 
 
 # ---------------------------------------------------------------------------
@@ -192,13 +195,20 @@ def _load_recent_history(db: Database, operator_id: str, limit: int = 10) -> lis
     return messages
 
 
-def _format_recent_turns(db: Database, operator_id: str, limit: int = 6) -> list[dict[str, str]]:
+def _format_recent_turns(db: Database, operator_id: str, limit: int = _RECENT_TURN_LIMIT) -> list[dict[str, str]]:
     """Return recent turns as the {role, content} shape Agent C expects."""
     messages, _ = _load_message_page(db, operator_id, limit=limit)
     return [
-        {"role": str(msg.get("role") or ""), "content": str(msg.get("content") or "")}
+        {"role": str(msg.get("role") or ""), "content": _trim_recent_turn_content(msg.get("content"))}
         for msg in messages
     ]
+
+
+def _trim_recent_turn_content(content: Any) -> str:
+    text = str(content or "").strip()
+    if len(text) <= _RECENT_TURN_CHAR_LIMIT:
+        return text
+    return text[: _RECENT_TURN_CHAR_LIMIT - 1].rstrip() + "..."
 
 
 def _age_seconds(produced_at: Any, now: datetime) -> float:
@@ -557,7 +567,10 @@ def _should_auto_retrieve_context(
         "rain", "weather", "precip", "chance", "likely", "alert", "covers",
         "forecast", "demand", "low", "high", "busy", "slow", "why", "usual",
     )
-    followup_terms = ("it", "that", "this", "you mean", "how likely", "why", "tomorrow", "tonight")
+    followup_terms = (
+        "it", "that", "this", "you mean", "how likely", "why", "tomorrow", "tonight",
+        "earlier", "previous", "last week", "you said", "we discussed",
+    )
     looks_contextual = any(term in lowered for term in context_terms)
     looks_followup = any(term in lowered for term in followup_terms) or len(lowered.split()) <= 6
     if not looks_contextual and not looks_followup:
@@ -566,7 +579,7 @@ def _should_auto_retrieve_context(
     return service_date is not None or looks_contextual
 
 
-def _should_preload_forecast_why(
+def _should_preload_evidence_pack(
     *,
     operator_message: str,
     current_digest: dict[str, Any],
@@ -591,6 +604,9 @@ def _is_ai_failure_text(text: str) -> bool:
     return (
         lowered.startswith("i cannot answer in chat right now")
         or lowered.startswith("i could not ground that answer")
+        or lowered.startswith("chat could not reach the model")
+        or lowered.startswith("chat could not produce a reply")
+        or lowered.startswith("i do not have the latest forecast snapshot yet")
     )
 
 
@@ -603,6 +619,57 @@ def _retrieval_topic(message: str) -> str | None:
     if any(term in lowered for term in ("actual", "miss", "came in")):
         return "actuals"
     return None
+
+
+def _build_evidence_tool_calls(
+    *,
+    operator_message: str,
+    current_digest: dict[str, Any],
+    recent_turns: list[dict[str, str]],
+) -> list[tuple[str, dict[str, Any]]]:
+    service_date = _resolve_context_service_date(operator_message, current_digest, recent_turns)
+    topic = _retrieval_topic(operator_message)
+    calls: list[tuple[str, dict[str, Any]]] = []
+
+    if service_date is not None:
+        service_date_arg = service_date.isoformat()
+        calls.append(("query_forecast_why", {"service_date": service_date_arg}))
+        if topic == "weather":
+            calls.append(("query_service_weather", {"service_date": service_date_arg}))
+
+    if _needs_conversation_recall(operator_message):
+        args: dict[str, Any] = {"limit": 12}
+        if topic:
+            args["topic"] = topic
+        calls.append(("query_recent_conversation_context", args))
+
+    deduped: list[tuple[str, dict[str, Any]]] = []
+    seen: set[tuple[str, str]] = set()
+    for name, args in calls:
+        key = (name, json.dumps(args, sort_keys=True, default=str))
+        if key in seen:
+            continue
+        seen.add(key)
+        deduped.append((name, args))
+        if len(deduped) >= 3:
+            break
+    return deduped
+
+
+def _needs_conversation_recall(message: str) -> bool:
+    lowered = message.lower()
+    recall_terms = (
+        "earlier",
+        "before",
+        "previous",
+        "last week",
+        "this week",
+        "what did i",
+        "what i asked",
+        "you said",
+        "we discussed",
+    )
+    return any(term in lowered for term in recall_terms)
 
 
 def _resolve_context_service_date(
@@ -772,7 +839,7 @@ def _sanitize_tool_data(tool_name: str, data: dict[str, Any]) -> dict[str, Any]:
     if tool_name == "query_recent_conversation_context":
         return {
             "topic": data.get("topic"),
-            "turns": list(data.get("turns") or [])[:8],
+            "turns": list(data.get("turns") or [])[:12],
         }
     return data
 
@@ -1029,7 +1096,7 @@ class UnifiedAgentService:
             or not self.provider.is_available()
             or operator_id is None
         ):
-            response = self._ai_unavailable_response(operator_id=operator_id, phase=phase)
+            response = self._ai_unavailable_response(operator_id=operator_id, phase=phase, reason="model")
             self._persist_exchange(operator_id, message, response)
             return response
 
@@ -1043,7 +1110,7 @@ class UnifiedAgentService:
         current_row = digest_repo.fetch_latest(operator_id=operator_id, kind="current_state")
         temporal_row = digest_repo.fetch_latest(operator_id=operator_id, kind="temporal")
         if current_row is None or temporal_row is None:
-            response = self._ai_unavailable_response(operator_id=operator_id, phase=phase)
+            response = self._ai_unavailable_response(operator_id=operator_id, phase=phase, reason="context")
             self._persist_exchange(operator_id, message, response)
             return response
 
@@ -1068,12 +1135,12 @@ class UnifiedAgentService:
 
         text = str(output.get("text") or "").strip()
         if not text:
-            text = _CHAT_AI_UNAVAILABLE_TEXT
+            text = _CHAT_MODEL_UNAVAILABLE_TEXT
 
         note_captured = any(tr.tool_name == "capture_note" and tr.success for tr in tool_results)
         text = _post_generation_guard(text)
         if not text:
-            text = _CHAT_AI_UNAVAILABLE_TEXT
+            text = _CHAT_MODEL_UNAVAILABLE_TEXT
 
         response = AgentResponse(
             text=text,
@@ -1138,7 +1205,7 @@ class UnifiedAgentService:
             }
         preloaded_tool_results: list[ToolResult] = []
         preloaded_serialized_results: list[dict[str, Any]] = []
-        if _should_preload_forecast_why(
+        if _should_preload_evidence_pack(
             operator_message=operator_message,
             current_digest=current_digest,
             recent_turns=recent_turns,
@@ -1182,7 +1249,7 @@ class UnifiedAgentService:
                 recent_turns=recent_turns,
                 serialized_results=preloaded_serialized_results,
             )
-            if retry_output:
+            if retry_output and not _is_ai_failure_text(str(retry_output.get("text") or "")):
                 return retry_output, preloaded_tool_results, operator_id
 
         if _should_auto_retrieve_context(
@@ -1207,7 +1274,7 @@ class UnifiedAgentService:
                     recent_turns=recent_turns,
                     serialized_results=auto_serialized_results,
                 )
-                if auto_output:
+                if auto_output and not _is_ai_failure_text(str(auto_output.get("text") or "")):
                     return auto_output, auto_tool_results, operator_id
 
         tool_calls = output.get("tool_calls") or []
@@ -1264,7 +1331,7 @@ class UnifiedAgentService:
             recent_turns=recent_turns,
             serialized_results=serialized_results,
         )
-        if output2:
+        if output2 and not _is_ai_failure_text(str(output2.get("text") or "")):
             return output2, tool_results, current_operator_id
         return output, tool_results, current_operator_id
 
@@ -1317,12 +1384,13 @@ class UnifiedAgentService:
         current_digest: dict[str, Any],
         recent_turns: list[dict[str, str]],
     ) -> tuple[list[ToolResult], list[dict[str, Any]]]:
-        service_date = _resolve_context_service_date(operator_message, current_digest, recent_turns)
-        if service_date is None:
+        calls = _build_evidence_tool_calls(
+            operator_message=operator_message,
+            current_digest=current_digest,
+            recent_turns=recent_turns,
+        )
+        if not calls:
             return [], []
-        calls: list[tuple[str, dict[str, Any]]] = [
-            ("query_forecast_why", {"service_date": service_date.isoformat()}),
-        ]
         tool_results: list[ToolResult] = []
         serialized_results: list[dict[str, Any]] = []
         for tool_name, args in calls:
@@ -1339,8 +1407,8 @@ class UnifiedAgentService:
         return tool_results, serialized_results
 
     @staticmethod
-    def _ai_unavailable_response(*, operator_id: str | None, phase: str) -> AgentResponse:
-        text = _CHAT_AI_UNAVAILABLE_TEXT
+    def _ai_unavailable_response(*, operator_id: str | None, phase: str, reason: str = "model") -> AgentResponse:
+        text = _CHAT_CONTEXT_UNAVAILABLE_TEXT if reason == "context" else _CHAT_MODEL_UNAVAILABLE_TEXT
         return AgentResponse(
             text=text,
             operator_id=operator_id,

@@ -196,7 +196,7 @@ class UnifiedSetupDispatchTests(unittest.TestCase):
 
         self.assertEqual(
             response.text,
-            "I cannot answer in chat right now because the AI response was unavailable.",
+            "Chat could not produce a reply this time. Please try again in a moment.",
         )
         self.assertNotIn("setup details", response.text.lower())
 

@@ -8,6 +8,7 @@ import unittest
 from stormready_v3.agents.tools import ToolExecutor
 from stormready_v3.agents.unified import (
     _extract_prior_turn_facts,
+    _format_recent_turns,
     _learning_resolution_text,
     _maybe_resolve_learning_agenda_reply,
     _post_generation_guard,
@@ -163,6 +164,22 @@ class OperatorCommunicationTests(unittest.TestCase):
         )
 
         self.assertEqual(facts, [{"date": "Thursday", "expected": 112}])
+
+    def test_recent_turns_keep_larger_active_window(self) -> None:
+        for index in range(25):
+            self.db.execute(
+                """
+                INSERT INTO conversation_messages (operator_id, role, content, phase)
+                VALUES (?, ?, ?, ?)
+                """,
+                ["test_operator", "assistant" if index % 2 else "operator", f"message {index}", "operations"],
+            )
+
+        turns = _format_recent_turns(self.db, "test_operator")
+
+        self.assertEqual(len(turns), 20)
+        self.assertEqual(turns[0]["content"], "message 5")
+        self.assertEqual(turns[-1]["content"], "message 24")
 
     def test_notification_message_dedupes_near_duplicates(self) -> None:
         created_at = datetime(2026, 4, 14, 12, 0, tzinfo=UTC)

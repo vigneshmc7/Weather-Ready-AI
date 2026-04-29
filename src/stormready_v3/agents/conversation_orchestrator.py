@@ -34,8 +34,8 @@ from .base import (
 _MAX_SUGGESTED = 3
 _MAX_SUGGESTED_LEN = 60
 _MAX_TEXT_CHARS = 900
-_MODEL_FAILURE_TEXT = "I cannot answer in chat right now because the AI response was unavailable."
-_MODEL_UNGROUNDED_TEXT = "I could not ground that answer cleanly, so I will not guess."
+_MODEL_FAILURE_TEXT = "Chat could not produce a reply this time. Please try again in a moment."
+_MODEL_UNGROUNDED_TEXT = "I do not have enough grounded information to answer that cleanly."
 _NUMBER_RE = re.compile(r"(?<![\w.])(-?\d+(?:\.\d+)?)(?!\w)")
 _SENTENCE_SPLIT_RE = re.compile(r"(?<=[.!?])\s+(?=[A-Z])")
 
@@ -82,6 +82,14 @@ KNOWN_TOOLS = {
     "query_forecast_why": {
         "description": "Compact date-specific reason packet for forecast, demand, weather, or follow-up why questions.",
         "arguments": {"service_date": "str (YYYY-MM-DD)"},
+    },
+    "query_service_weather": {
+        "description": "Dinner-specific weather details, rain probability, dinner overlap, and official weather alert context.",
+        "arguments": {"service_date": "str (YYYY-MM-DD)"},
+    },
+    "query_recent_conversation_context": {
+        "description": "Recent operator and assistant turns for vague follow-ups or prior-conversation recall.",
+        "arguments": {"limit": "int | null", "topic": "str | null"},
     },
     "query_hypothesis_backlog": {
         "description": "List open/confirmed/rejected hypotheses.",

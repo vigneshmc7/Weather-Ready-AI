@@ -357,7 +357,7 @@ class ToolExecutorQueryToolTests(unittest.TestCase):
         )
         dispatcher = RecordingDispatcher(
             first_output={
-                "text": "I cannot answer in chat right now because the AI response was unavailable.",
+                "text": "Chat could not produce a reply this time. Please try again in a moment.",
                 "tool_calls": [],
                 "suggested_messages": [],
             },
@@ -379,9 +379,13 @@ class ToolExecutorQueryToolTests(unittest.TestCase):
         self.assertGreaterEqual(len(dispatcher.calls), 2)
         followup_payload = dict(dispatcher.calls[1].payload)
         tool_names = [result["tool"] for result in followup_payload["tool_results"]]
-        self.assertEqual(tool_names, ["query_forecast_why"])
+        self.assertEqual(tool_names, ["query_forecast_why", "query_service_weather"])
         self.assertEqual(
             followup_payload["answer_packet"]["forecast_why"]["weather_context"]["precip_chance_pct"],
+            54,
+        )
+        self.assertEqual(
+            followup_payload["answer_packet"]["service_weather"]["weather"]["precip_chance_pct"],
             54,
         )
 
