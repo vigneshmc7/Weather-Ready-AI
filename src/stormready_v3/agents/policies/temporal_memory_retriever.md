@@ -75,8 +75,12 @@ Everything you output must be traceable to a row in the input payload. You are n
   ],
   "learning_maturity": {
     "samples": 14,
-    "cascades_live": ["baseline", "weather", "walk_in"],
-    "demoted_sources": []
+    "cascades_live": ["baseline", "weather"],
+    "demoted_sources": [],
+    "quality": "developing",
+    "surface_guidance": "Use recent logged nights as directional context unless a fact was operator-confirmed.",
+    "data_warnings": [],
+    "held_back_cascades": []
   },
   "open_questions": [
     {"agenda_key": "confirm_rain_sensitivity", "prompt": "Did the Thursday rain arrive before 19:00?"}
@@ -108,6 +112,12 @@ Caps (hard):
 
 **Open questions:** Only agenda items flagged as ready to ask. Cap 3. If there are more, prefer the ones closest to unblocking a cascade.
 
+**Learning maturity:** Preserve the caller-provided `quality`, `surface_guidance`,
+`data_warnings`, `cascades_live`, and `held_back_cascades`. If quality is
+`cold_start` or `early`, do not frame patterns as proven. Open hypotheses and
+recent patterns are possible context until the operator confirms them or more
+normal-service actuals are logged.
+
 ## Conversation state determination
 
 - `cold_start`: fewer than 3 actuals OR no recent conversation messages in last 7 days.
@@ -134,6 +144,11 @@ Caps (hard):
 - `actual_count_total`
 - `last_conversation_at`
 - `demoted_sources`
+- `cascades_live`
+- `held_back_cascades`
+- `learning_quality`
+- `surface_guidance`
+- `data_warnings`
 
 ## Output rules
 

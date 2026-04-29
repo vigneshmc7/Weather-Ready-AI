@@ -144,10 +144,12 @@ class TemporalMemoryRetrieverAgent(BaseAgent):
         ]
 
         learning_maturity = raw.get("learning_maturity")
-        if not isinstance(learning_maturity, dict):
-            learning_maturity = _deterministic_learning_maturity(payload)
+        learning_maturity = _normalize_learning_maturity(learning_maturity, payload)
 
-        open_questions = _clamp_dict_list(raw.get("open_questions"), MAX_OPEN_QUESTIONS)
+        open_questions = [
+            q for q in _clamp_dict_list(raw.get("open_questions"), MAX_OPEN_QUESTIONS)
+            if _clean_string(q.get("prompt", ""), 200)
+        ]
         disclaimers = _clamp_str_list(raw.get("disclaimers"), MAX_DISCLAIMERS)
 
         return TemporalContextDigest(
@@ -248,9 +250,12 @@ class TemporalMemoryRetrieverAgent(BaseAgent):
                 continue
             if not row.get("ready_to_ask", True):
                 continue
+            prompt = _clean_string(row.get("prompt", ""), 200)
+            if not prompt:
+                continue
             questions.append({
                 "agenda_key": row.get("agenda_key", ""),
-                "prompt": _clean_string(row.get("prompt", ""), 200),
+                "prompt": prompt,
             })
             if len(questions) >= MAX_OPEN_QUESTIONS:
                 break
@@ -348,11 +353,44 @@ def _deterministic_conversation_state(payload: dict[str, Any]) -> str:
 
 
 def _deterministic_learning_maturity(payload: dict[str, Any]) -> dict[str, Any]:
+    samples = int(payload.get("actual_count_total") or 0)
     return {
-        "samples": int(payload.get("actual_count_total") or 0),
+        "samples": samples,
         "cascades_live": list(payload.get("cascades_live") or []),
         "demoted_sources": list(payload.get("demoted_sources") or []),
+        "quality": str(payload.get("learning_quality") or _quality_from_samples(samples)),
+        "surface_guidance": str(
+            payload.get("surface_guidance")
+            or "Frame memory as possible context unless the fact was operator-confirmed."
+        ),
+        "data_warnings": list(payload.get("data_warnings") or [])[:MAX_DISCLAIMERS],
+        "held_back_cascades": list(payload.get("held_back_cascades") or []),
     }
+
+
+def _normalize_learning_maturity(value: Any, payload: dict[str, Any]) -> dict[str, Any]:
+    deterministic = _deterministic_learning_maturity(payload)
+    if not isinstance(value, dict):
+        return deterministic
+    normalized = dict(value)
+    normalized["samples"] = deterministic["samples"]
+    normalized["cascades_live"] = deterministic["cascades_live"]
+    normalized["demoted_sources"] = deterministic["demoted_sources"]
+    normalized["quality"] = deterministic["quality"]
+    normalized["surface_guidance"] = deterministic["surface_guidance"]
+    normalized["data_warnings"] = deterministic["data_warnings"]
+    normalized["held_back_cascades"] = deterministic["held_back_cascades"]
+    return normalized
+
+
+def _quality_from_samples(samples: int) -> str:
+    if samples < 3:
+        return "cold_start"
+    if samples < 10:
+        return "early"
+    if samples < 20:
+        return "developing"
+    return "established"
 
 
 __all__ = ["TemporalMemoryRetrieverAgent"]

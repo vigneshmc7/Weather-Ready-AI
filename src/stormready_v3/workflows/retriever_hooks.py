@@ -9,11 +9,13 @@ work must not be rolled back by a model hiccup.
 
 from __future__ import annotations
 
+import json
 import uuid
 from datetime import UTC, date, datetime
 from typing import TYPE_CHECKING, Any, Iterable
 
 from stormready_v3.agents.base import AgentContext, AgentRole, AgentStatus
+from stormready_v3.operator_text import communication_text_from_payload
 from stormready_v3.storage.db import Database
 from stormready_v3.storage.repositories import (
     OperatorContextDigestRepository,
@@ -187,7 +189,6 @@ def _persist_digest(
     produced_at_raw = digest_body.get("produced_at")
     produced_at = _parse_datetime(produced_at_raw) or datetime.now(UTC)
     source_hash = str(digest_body.get("source_hash") or "")
-    import json
 
     try:
         payload_json = json.dumps(digest_body, default=str, ensure_ascii=False)
@@ -264,9 +265,9 @@ def _build_temporal_payload(
 ) -> dict[str, Any]:
     recent_misses_raw = [
         {
-            "service_date": ev.get("date"),
+            "service_date": ev.get("service_date") or ev.get("date"),
             "err_pct": ev.get("error_pct"),
-            "service_state": "normal",
+            "service_state": _evaluation_service_state(ev),
             "short_label": _short_miss_label(ev),
         }
         for ev in (conversation.recent_evaluations or [])
@@ -276,7 +277,7 @@ def _build_temporal_payload(
     open_hypotheses = [
         {
             "hypothesis_key": h.get("hypothesis_key") or h.get("key") or "",
-            "proposition": h.get("proposition") or h.get("summary") or "",
+            "proposition": _hypothesis_proposition(h),
             "status": h.get("status", "open"),
             "confidence": h.get("confidence", "low"),
         }
@@ -292,7 +293,7 @@ def _build_temporal_payload(
     operator_facts_raw = [
         {
             "key": fact.get("fact_key") or fact.get("key") or "",
-            "value": fact.get("fact_value") or fact.get("value") or "",
+            "value": _fact_value_for_temporal_prompt(fact),
             "confidence": fact.get("confidence", "low"),
         }
         for fact in (conversation.operator_facts or [])
@@ -301,7 +302,7 @@ def _build_temporal_payload(
     learning_agenda_rows = [
         {
             "agenda_key": item.get("agenda_key") or item.get("key") or "",
-            "prompt": item.get("prompt") or item.get("question_text") or "",
+            "prompt": _agenda_prompt(item),
             "ready_to_ask": bool(item.get("ready_to_ask", True)),
         }
         for item in (conversation.learning_agenda or [])
@@ -309,6 +310,12 @@ def _build_temporal_payload(
 
     actual_count_total = _count_actuals(db, operator_id)
     last_conversation_at = _last_conversation_at(db, operator_id)
+    cascades_live, held_back_cascades = _live_learning_cascades(db, operator_id)
+    learning_quality = _learning_quality(actual_count_total)
+    data_warnings = _temporal_data_warnings(
+        actual_count_total=actual_count_total,
+        held_back_cascades=held_back_cascades,
+    )
     demoted = [
         src.get("source_name") or src.get("name")
         for src in (conversation.watched_external_sources or [])
@@ -325,8 +332,156 @@ def _build_temporal_payload(
         "last_conversation_at": last_conversation_at,
         "demoted_sources": [d for d in demoted if d],
         "has_pending_followup": bool(conversation.pending_corrections),
-        "cascades_live": [],
+        "cascades_live": cascades_live,
+        "held_back_cascades": held_back_cascades,
+        "learning_quality": learning_quality,
+        "surface_guidance": _surface_guidance_for_quality(learning_quality),
+        "data_warnings": data_warnings,
     }
+
+
+def _evaluation_service_state(evaluation: dict[str, Any]) -> str:
+    eligibility = str(evaluation.get("service_state_learning_eligibility") or "").strip().lower()
+    if eligibility == "normal":
+        return "normal"
+    if eligibility:
+        return eligibility
+    service_state = str(evaluation.get("service_state") or "").strip().lower()
+    return service_state or "normal"
+
+
+def _hypothesis_proposition(hypothesis: dict[str, Any]) -> str:
+    direct = hypothesis.get("proposition") or hypothesis.get("summary")
+    if direct:
+        return str(direct)
+    value = hypothesis.get("hypothesis_value")
+    if isinstance(value, dict):
+        for key in ("proposition", "summary", "what_is_true_now", "why_it_matters"):
+            raw = value.get(key)
+            if raw:
+                return str(raw)
+        payload = value.get("communication_payload")
+        if isinstance(payload, dict):
+            rendered = communication_text_from_payload(payload)
+            if rendered:
+                return rendered
+    return ""
+
+
+def _fact_value_for_temporal_prompt(fact: dict[str, Any]) -> str:
+    value = fact.get("fact_value") if "fact_value" in fact else fact.get("value")
+    if isinstance(value, dict):
+        for key in ("summary", "note", "value", "effect", "what_is_true_now"):
+            raw = value.get(key)
+            if raw:
+                return str(raw)
+        try:
+            return json.dumps(value, default=str, sort_keys=True)
+        except (TypeError, ValueError):
+            return str(value)
+    return str(value or "")
+
+
+def _agenda_prompt(item: dict[str, Any]) -> str:
+    direct = item.get("prompt") or item.get("question_text")
+    if direct:
+        return str(direct)
+    payload = item.get("communication_payload")
+    if isinstance(payload, dict):
+        rendered = communication_text_from_payload(payload)
+        if rendered:
+            return rendered
+    for key in ("rationale", "expected_impact"):
+        raw = item.get(key)
+        if raw:
+            return str(raw)
+    return ""
+
+
+def _learning_quality(actual_count_total: int) -> str:
+    if actual_count_total < 3:
+        return "cold_start"
+    if actual_count_total < 10:
+        return "early"
+    if actual_count_total < 20:
+        return "developing"
+    return "established"
+
+
+def _surface_guidance_for_quality(quality: str) -> str:
+    if quality in {"cold_start", "early"}:
+        return "Frame memory as early context or possible patterns, not as confirmed learning."
+    if quality == "developing":
+        return "Use recent logged nights as directional context unless a fact was operator-confirmed."
+    return "Confirmed facts and repeated normal-service patterns may be stated more directly."
+
+
+def _temporal_data_warnings(*, actual_count_total: int, held_back_cascades: list[str]) -> list[str]:
+    warnings: list[str] = []
+    if actual_count_total < 10:
+        warnings.append("Only a small number of actuals are logged; treat patterns as early.")
+    if "component" in held_back_cascades:
+        warnings.append("Component and patio learning is still guarded from operator-facing claims.")
+    return warnings[:3]
+
+
+def _live_learning_cascades(db: Database, operator_id: str) -> tuple[list[str], list[str]]:
+    live: list[str] = []
+    held_back: list[str] = []
+    checks = [
+        (
+            "baseline",
+            "SELECT 1 FROM baseline_learning_state WHERE operator_id = ? AND COALESCE(history_depth, 0) > 0 LIMIT 1",
+        ),
+        (
+            "confidence",
+            "SELECT 1 FROM confidence_calibration_state WHERE operator_id = ? AND COALESCE(sample_size, 0) > 0 LIMIT 1",
+        ),
+        (
+            "weather",
+            "SELECT 1 FROM weather_signature_state WHERE operator_id = ? AND COALESCE(sample_size, 0) > 0 LIMIT 1",
+        ),
+        (
+            "weather",
+            "SELECT 1 FROM weather_sensitivity_state WHERE operator_id = ? AND COALESCE(sample_size, 0) > 0 LIMIT 1",
+        ),
+        (
+            "external",
+            "SELECT 1 FROM external_scan_learning_state WHERE operator_id = ? AND COALESCE(sample_size, 0) > 0 LIMIT 1",
+        ),
+        (
+            "external",
+            "SELECT 1 FROM context_effect_state WHERE operator_id = ? AND COALESCE(sample_size, 0) > 0 LIMIT 1",
+        ),
+        (
+            "adaptation",
+            "SELECT 1 FROM prediction_adaptation_state WHERE operator_id = ? AND COALESCE(sample_size, 0) > 0 LIMIT 1",
+        ),
+    ]
+    for name, sql in checks:
+        if name in live:
+            continue
+        try:
+            if db.fetchone(sql, [operator_id]) is not None:
+                live.append(name)
+        except Exception:
+            continue
+    try:
+        component_row = db.fetchone(
+            """
+            SELECT 1
+            FROM component_learning_state
+            WHERE operator_id = ?
+              AND COALESCE(observation_count, 0) > 0
+            LIMIT 1
+            """,
+            [operator_id],
+        )
+        if component_row is not None:
+            held_back.append("component")
+    except Exception:
+        pass
+    return live, held_back
 
 
 def _phase_for_profile(profile: "OperatorProfile") -> str:
@@ -470,7 +625,7 @@ def _maturity_hint(
 
 def _short_miss_label(evaluation: dict[str, Any]) -> str:
     err = evaluation.get("error_pct")
-    date_label = evaluation.get("date")
+    date_label = evaluation.get("service_date") or evaluation.get("date")
     if err is None:
         return str(date_label or "")
     try:

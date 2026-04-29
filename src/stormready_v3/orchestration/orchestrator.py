@@ -1796,7 +1796,7 @@ class DeterministicOrchestrator:
                     dispatcher=self._agent_dispatcher,
                     operator_id=profile.operator_id,
                     reference_date=run_date,
-                    kinds=("current_state",),
+                    kinds=("current_state", "temporal"),
                 )
             return plan
         except Exception as exc:

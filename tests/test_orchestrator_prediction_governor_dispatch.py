@@ -5,7 +5,7 @@ from pathlib import Path
 from types import SimpleNamespace
 import tempfile
 import unittest
-from datetime import date
+from datetime import UTC, date, datetime
 from unittest.mock import patch
 
 from stormready_v3.agents.base import AgentResult, AgentRole, AgentStatus
@@ -13,11 +13,13 @@ from stormready_v3.domain.enums import (
     ForecastRegime,
     HorizonMode,
     PredictionCase,
+    RefreshReason,
     ServiceState,
     ServiceWindow,
 )
 from stormready_v3.domain.models import CandidateForecastState
 from stormready_v3.orchestration.orchestrator import DeterministicOrchestrator
+from stormready_v3.orchestration.planner import RefreshPlan
 from stormready_v3.storage.db import Database
 from stormready_v3.storage.repositories import AgentFrameworkRepository
 
@@ -192,6 +194,49 @@ class OrchestratorPredictionGovernorDispatchTests(unittest.TestCase):
 
         self.assertEqual(learning_context["operator_facts"][0]["fact_key"], "patio::rain")
         self.assertEqual(learning_context["confirmed_hypotheses"][0]["hypothesis_key"], "rain_patio")
+
+    def test_refresh_cycle_runs_current_and_temporal_retrievers(self) -> None:
+        orchestrator = DeterministicOrchestrator.__new__(DeterministicOrchestrator)
+        orchestrator.db = object()
+        orchestrator._agent_dispatcher = object()
+        orchestrator.external_catalog = SimpleNamespace(run_refresh_discovery=lambda **_kwargs: {"ok": True})
+        orchestrator.utc_now = lambda: datetime(2026, 4, 14, 12, 0, tzinfo=UTC)
+        orchestrator._start_refresh_run = lambda **_kwargs: "refresh_1"
+        orchestrator._complete_refresh_run = lambda **_kwargs: None
+        refreshed: list[tuple[date, ServiceWindow]] = []
+
+        def fake_refresh_with_stored_baseline(**kwargs):  # noqa: ANN001
+            refreshed.append((kwargs["service_date"], kwargs["service_window"]))
+
+        orchestrator.refresh_with_stored_baseline = fake_refresh_with_stored_baseline
+        plan = RefreshPlan(
+            reason=RefreshReason.OPERATOR_REQUESTED,
+            run_date=date(2026, 4, 14),
+            actionable_dates=[date(2026, 4, 14)],
+            working_dates=[],
+            refresh_window="midday",
+        )
+        profile = SimpleNamespace(
+            operator_id="op1",
+            active_service_windows=[ServiceWindow.DINNER],
+            primary_service_window=ServiceWindow.DINNER,
+        )
+
+        with (
+            patch("stormready_v3.orchestration.orchestrator.plan_refresh_cycle", return_value=plan),
+            patch("stormready_v3.workflows.retriever_hooks.run_retriever_hooks") as retriever_hooks,
+        ):
+            result = orchestrator.run_refresh_cycle(
+                profile=profile,
+                location_context=SimpleNamespace(),
+                refresh_reason=RefreshReason.OPERATOR_REQUESTED,
+                run_date=date(2026, 4, 14),
+            )
+
+        self.assertEqual(result, plan)
+        self.assertEqual(refreshed, [(date(2026, 4, 14), ServiceWindow.DINNER)])
+        retriever_hooks.assert_called_once()
+        self.assertEqual(retriever_hooks.call_args.kwargs["kinds"], ("current_state", "temporal"))
 
 
 if __name__ == "__main__":

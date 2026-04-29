@@ -105,6 +105,39 @@ class TemporalMemoryRetrieverAgentTests(unittest.TestCase):
         self.assertEqual(digest["conversation_state"], "active")
         self.assertEqual(len(digest["recent_misses"]), 1)
 
+    def test_learning_maturity_uses_payload_quality_over_model_claims(self) -> None:
+        payload = _base_payload()
+        payload["learning_quality"] = "early"
+        payload["surface_guidance"] = "Frame these as possible patterns."
+        payload["data_warnings"] = ["Only a small number of actuals are logged."]
+        payload["held_back_cascades"] = ["component"]
+        llm_response = {
+            "digest": {
+                "conversation_state": "active",
+                "recent_misses": [],
+                "active_hypotheses": [],
+                "recent_patterns": [],
+                "operator_facts": [],
+                "learning_maturity": {
+                    "samples": 999,
+                    "cascades_live": ["everything"],
+                    "quality": "established",
+                },
+                "open_questions": [],
+                "disclaimers": [],
+            }
+        }
+        provider = FakeProvider(llm_response)
+        agent = TemporalMemoryRetrieverAgent(self.policy, provider)
+        result = agent.run(_ctx(payload))
+        maturity = result.outputs[0]["learning_maturity"]
+
+        self.assertEqual(maturity["samples"], 14)
+        self.assertEqual(maturity["quality"], "early")
+        self.assertEqual(maturity["cascades_live"], ["baseline", "weather", "walk_in"])
+        self.assertEqual(maturity["surface_guidance"], "Frame these as possible patterns.")
+        self.assertEqual(maturity["held_back_cascades"], ["component"])
+
     def test_deterministic_filters_misses_below_threshold_and_abnormal(self) -> None:
         provider = FakeProvider(response=None)
         agent = TemporalMemoryRetrieverAgent(self.policy, provider)

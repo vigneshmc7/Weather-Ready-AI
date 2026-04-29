@@ -430,7 +430,7 @@ class ConversationContextService:
         rows = self.db.fetchall(
             """
             SELECT service_date, service_window, actual_total_covers, forecast_expected, error_abs,
-                   error_pct, inside_interval, evaluated_at
+                   error_pct, inside_interval, evaluated_at, service_state_learning_eligibility
             FROM prediction_evaluations
             WHERE operator_id = ?
             ORDER BY evaluated_at DESC
@@ -448,6 +448,7 @@ class ConversationContextService:
                 "error_pct": row[5],
                 "inside_interval": row[6],
                 "evaluated_at": row[7],
+                "service_state_learning_eligibility": row[8],
             }
             for row in rows
         ]
